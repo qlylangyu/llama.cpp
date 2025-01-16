@@ -265,7 +265,7 @@ bool internvl_eval_image_embed(llama_context * ctx_llama, const struct internvl_
             n_eval = n_batch;
         }
         llama_batch batch = {int32_t(n_eval), nullptr, (image_embed->embed+i*n_embd), nullptr, nullptr, nullptr, nullptr, *n_past, 1, 0, };
-        if (llama_decode(ctx_llama, batch)) {
+        if (llama_decode(ctx_llama, batch)) { // exception Date: 1/9/2025
             fprintf(stderr, "%s : failed to eval\n", __func__);
             return false;
         }

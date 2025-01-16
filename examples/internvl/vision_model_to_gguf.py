@@ -1,9 +1,13 @@
 import argparse
 import os
-
+import sys
+from pathlib import Path
 import torch
 from safetensors.torch import load_file
 import numpy as np
+
+sys.path.insert(1, str(Path(__file__).parent.parent.parent / 'gguf-py'))
+
 from gguf import *
 
 VISION = "clip.vision"
@@ -68,6 +72,14 @@ with open(os.path.join(dir_model, "config.json"), "r", encoding="utf-8") as conf
     config = json.load(config_file)
     hparams = config["vision_config"]
 
+# add missing parameters
+fout.add_bool("clip.has_text_encoder",False)
+fout.add_bool("clip.has_vision_encoder",True)
+fout.add_bool("clip.has_llava_projector",True)
+fout.add_bool("clip.use_gelu",True)
+fout.add_uint32('clip.vision.projection_dim',768)
+
+# original
 fout.add_uint32("clip.vision.image_size", hparams["image_size"])
 fout.add_uint32("clip.vision.patch_size", hparams["patch_size"])
 fout.add_uint32(k(KEY_EMBEDDING_LENGTH, VISION), hparams["hidden_size"])
@@ -91,6 +103,14 @@ for name, data in model.items():
     if name.find('language_model') != -1:
         continue
     name = get_tensor_name(name)
+
+    # replace mlp tensor names and more
+
+    # if name.startswith("mlp1"): name = name.replace("mlp1", "mm")
+    # if "attn.proj" in name: name = name.replace("attn.proj", "attn_out")
+    # if "mlp.fc1" in name: name = name.replace("mlp.fc1", "ffn_down")
+    # if "mlp.fc2" in name: name = name.replace("mlp.fc2", "ffn_up")
+
     data = data.float().numpy()
     # pw and dw conv ndim==4
     if (data.ndim == 2 or data.ndim == 4) and ftype == 1:
@@ -109,9 +129,16 @@ for name, data in model.items():
         
 
         print(f"{name} shape {data.shape} split into {len(qkv)} shape: {qkv[0].shape}, {qkv[1].shape}, {qkv[2].shape}")
+        
+        # original
         fout.add_tensor(name.replace(".attn.qkv", ".attn.q"), qkv[0])
         fout.add_tensor(name.replace(".attn.qkv", ".attn.k"), qkv[1])
         fout.add_tensor(name.replace(".attn.qkv", ".attn.v"), qkv[2])
+
+        # change naming 
+        # fout.add_tensor(name.replace(".attn.qkv", ".attn_q"), qkv[0])
+        # fout.add_tensor(name.replace(".attn.qkv", ".attn_k"), qkv[1])
+        # fout.add_tensor(name.replace(".attn.qkv", ".attn_v"), qkv[2])
     else:
         fout.add_tensor(name, data)
 
