@@ -45,7 +45,7 @@ python convert_hf_to_gguf.py path/to/adjusted-internlm-chat/
 6. Use `vision_model_to_gguf.py` to convert the image encoder to GGUF:
 
 ```sh
-python vision_model_to_gguf.py path/to/Mini-InternVL-Chat-2B-V1-5/model.safetensors
+python vision_model_to_gguf.py -m path/to/Mini-InternVL-Chat-2B-V1-5/model.safetensors
 ```
 
 7. Collect and rename the models:
