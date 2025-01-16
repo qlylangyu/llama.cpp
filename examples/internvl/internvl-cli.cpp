@@ -1,23 +1,26 @@
-#include "ggml.h"
+#include "arg.h"
+#include "base64.hpp"
+#include "log.h"
 #include "common.h"
+#include "sampling.h"
 #include "clip.h"
 #include "internvl.h"
 #include "llama.h"
+#include "ggml.h"
 
-#include "base64.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 
-static bool eval_tokens(struct llama_context * ctx_llama, std::vector<llama_token> tokens, int n_batch, int * n_past) {
+static bool eval_tokens(struct llama_context * ctx, std::vector<llama_token> tokens, int n_batch, int * n_past) {
     int N = (int) tokens.size();
     for (int i = 0; i < N; i += n_batch) {
         int n_eval = (int) tokens.size() - i;
         if (n_eval > n_batch) {
             n_eval = n_batch;
         }
-        if (llama_decode(ctx_llama, llama_batch_get_one(&tokens[i], n_eval, *n_past, 0))) {
+        if (llama_decode(ctx, llama_batch_get_one(&tokens[i], n_eval, *n_past, 0))) {
             fprintf(stderr, "%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
             return false;
         }
@@ -26,15 +29,15 @@ static bool eval_tokens(struct llama_context * ctx_llama, std::vector<llama_toke
     return true;
 }
 
-static bool eval_id(struct llama_context * ctx_llama, int id, int * n_past) {
+static bool eval_id(struct llama_context * ctx, int id, int * n_past) {
     std::vector<llama_token> tokens;
     tokens.push_back(id);
-    return eval_tokens(ctx_llama, tokens, 1, n_past);
+    return eval_tokens(ctx, tokens, 1, n_past);
 }
 
-static bool eval_string(struct llama_context * ctx_llama, const char* str, int n_batch, int * n_past, bool add_bos){
+static bool eval_string(struct llama_context * ctx, const char* str, int n_batch, int * n_past, bool add_bos){
     std::string              str2     = str;
-    std::vector<llama_token> embd_inp = ::llama_tokenize(ctx_llama, str2, add_bos, true);
+    std::vector<llama_token> embd_inp = ::llama_tokenize(ctx, str2, add_bos, true);
 
     // printf("prompt token ids: ");
     // for (int i = 0; i < (int) embd_inp.size(); i++) {
@@ -42,22 +45,26 @@ static bool eval_string(struct llama_context * ctx_llama, const char* str, int n
     // }
     // printf("\n");
 
-    eval_tokens(ctx_llama, embd_inp, n_batch, n_past);
+    eval_tokens(ctx, embd_inp, n_batch, n_past);
     return true;
 }
 
-static const char * sample(struct llama_sampling_context * ctx_sampling,
-                           struct llama_context * ctx_llama,
+// static const char * sample(struct llama_sampler * smpl,
+static const char * sample(struct gpt_sampler * smpl,
+                           struct llama_context * ctx,
                            int * n_past) {
-    const llama_token id = llama_sampling_sample(ctx_sampling, ctx_llama, NULL);
-    llama_sampling_accept(ctx_sampling, ctx_llama, id, true);
+    const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
+    // const llama_token id = llama_sampler_sample(smpl, ctx, -1); // exception, Date: 1/10/2025
+    gpt_sampler_accept(smpl, id, true);
+    // llama_sampler_accept(smpl, id);
+    // llama_sampler_accept(smpl, ctx, id, true);
     static std::string ret;
-    if (llama_token_is_eog(llama_get_model(ctx_llama), id)) {
+    if (llama_token_is_eog(llama_get_model(ctx), id)) {
         ret = "</s>";
     } else {
-        ret = llama_token_to_piece(ctx_llama, id);
+        ret = llama_token_to_piece(ctx, id);
     }
-    eval_id(ctx_llama, id, n_past);
+    eval_id(ctx, id, n_past);
     return ret.c_str();
 }
 
@@ -114,17 +121,24 @@ static std::string remove_image_from_prompt(const std::string& prompt, const cha
 
 struct internvl_context {
     struct clip_ctx * ctx_clip = NULL;
-    struct llama_context * ctx_llama = NULL;
+    struct llama_context * ctx = NULL;
     struct llama_model * model = NULL;
 };
 
-static void print_usage(int argc, char ** argv, const gpt_params & params) {
-    gpt_params_print_usage(argc, argv, params);
 
-    LOG_TEE("\n example usage:\n");
-    LOG_TEE("\n     %s -m <llava-v1.5-7b/ggml-model-q5_k.gguf> --mmproj <llava-v1.5-7b/mmproj-model-f16.gguf> --image <path/to/an/image.jpg> --image <path/to/another/image.jpg> [--temp 0.1] [-p \"describe the image in detail.\"]\n", argv[0]);
-    LOG_TEE("\n note: a lower temperature value like 0.1 is recommended for better quality.\n");
+static void print_usage(int, char ** argv) {
+    LOG_TEE("\nexample usage:\n");
+    LOG_TEE("\n    %s -m model.gguf -p \"Hello my name is\" -n 32 -np 4\n", argv[0]);
+    LOG_TEE("\n");
 }
+// static void print_usage(int argc, char ** argv) {
+// static void print_usage(int argc, char ** argv, const gpt_params & params) {
+//     gpt_params_print_usage(argc, argv, params);
+
+//     LOG_TEE("\n example usage:\n");
+//     LOG_TEE("\n     %s -m <llava-v1.5-7b/ggml-model-q5_k.gguf> --mmproj <llava-v1.5-7b/mmproj-model-f16.gguf> --image <path/to/an/image.jpg> --image <path/to/another/image.jpg> [--temp 0.1] [-p \"describe the image in detail.\"]\n", argv[0]);
+//     LOG_TEE("\n note: a lower temperature value like 0.1 is recommended for better quality.\n");
+// }
 
 static struct internvl_image_embed * load_image(internvl_context * ctx_internvl, gpt_params * params, const std::string & fname) {
 
@@ -135,14 +149,16 @@ static struct internvl_image_embed * load_image(internvl_context * ctx_internvl,
         if (!params->image.empty()) {
             fprintf(stderr, "using base64 encoded image instead of command line image path\n");
         }
-        embed = internvl_image_embed_make_with_prompt_base64(ctx_internvl->ctx_clip, params->n_threads, prompt);
+        embed = internvl_image_embed_make_with_prompt_base64(ctx_internvl->ctx_clip, 12, prompt);
+        // embed = internvl_image_embed_make_with_prompt_base64(ctx_internvl->ctx_clip, params->n_threads, prompt);
         if (!embed) {
             fprintf(stderr, "%s: can't load image from prompt\n", __func__);
             return NULL;
         }
         params->prompt = remove_image_from_prompt(prompt);
     } else {
-        embed = internvl_image_embed_make_with_filename(ctx_internvl->ctx_clip, params->n_threads, fname.c_str());
+        embed = internvl_image_embed_make_with_filename(ctx_internvl->ctx_clip, 12, fname.c_str());
+        // embed = internvl_image_embed_make_with_filename(ctx_internvl->ctx_clip, params->n_threads, fname.c_str());
         if (!embed) {
             fprintf(stderr, "%s: is %s really an image file?\n", __func__, fname.c_str());
             return NULL;
@@ -158,7 +174,8 @@ static void process_prompt(struct internvl_context * ctx_internvl, struct intern
     int n_past = 0;
 
     const int max_tgt_len = params->n_predict < 0 ? 256 : params->n_predict;
-    const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx_internvl->ctx_llama));
+    const bool add_bos = llama_add_bos_token(llama_get_model(ctx_internvl->ctx));
+    // const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx_internvl->ctx));
 
     // llava chat format is "'<|im_start|>system\nYou are an AI assistant whose name is InternLM (书生·浦语).<|im_end|><|im_start|>user\n<image>\n请描述图片.<|im_end|><|im_start|>assistant\n'"
     std::size_t img_tok_pos = prompt.find("<image>");
@@ -174,19 +191,28 @@ static void process_prompt(struct internvl_context * ctx_internvl, struct intern
         prompt2 = "\n" + prompt;
     }
     
-    eval_string(ctx_internvl->ctx_llama, ("<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|im_end|><|im_start|>user\n" + prompt1 + "<img>").c_str(), params->n_batch, &n_past, true);
-    // eval_string(ctx_internvl->ctx_llama, ("<|im_start|>system\nYou are an AI assistant whose name is InternLM (书生·浦语).<|im_end|><|im_start|>user\n" + prompt1 + "<img>").c_str(), params->n_batch, &n_past, true);
-    internvl_eval_image_embed(ctx_internvl->ctx_llama, image_embed, params->n_batch, &n_past);
-    eval_string(ctx_internvl->ctx_llama, ("</img>" + prompt2 + "<|im_end|><|im_start|>assistant\n").c_str(), params->n_batch, &n_past, false);
+    eval_string(ctx_internvl->ctx, ("<|im_start|>system\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|im_end|><|im_start|>user\n" + prompt1 + "<img>").c_str(), params->n_batch, &n_past, true);
+    // eval_string(ctx_internvl->ctx, ("<|im_start|>system\nYou are an AI assistant whose name is InternLM (书生·浦语).<|im_end|><|im_start|>user\n" + prompt1 + "<img>").c_str(), params->n_batch, &n_past, true);
+    internvl_eval_image_embed(ctx_internvl->ctx, image_embed, params->n_batch, &n_past); // exception Date: 1/9/2025
+    eval_string(ctx_internvl->ctx, ("</img>" + prompt2 + "<|im_end|><|im_start|>assistant\n").c_str(), params->n_batch, &n_past, false);
     // generate the response
 
     fprintf(stderr, "\n");
 
-    struct llama_sampling_context * ctx_sampling = llama_sampling_init(params->sparams);
+    // struct llama_sampler * smpl = gpt_sampler_init(ctx_internvl->model, params->sparams);
+    struct gpt_sampler * smpl = gpt_sampler_init(ctx_internvl->model, params->sparams);
+    // struct llama_sampler * smpl = llama_sampler_chain_init(params->sparams);
+
+    // auto sparams = llama_sampler_chain_default_params();
+    // struct llama_sampler * smpl = llama_sampler_chain_init(params -> sparams);
+    // struct llama_sampler * smpl = llama_sampler_chain_init(sparams);
+    // struct llama_sampler * smpl = llama_sampler_init(params->sparams);
+    
+    // struct llama_sampler * smpl = llama_sampler_chain_init(params->sparams);
 
     if (params->n_predict == -1) {
         while (true) {
-            const char *tmp = sample(ctx_sampling, ctx_internvl->ctx_llama, &n_past);
+            const char *tmp = sample(smpl, ctx_internvl->ctx, &n_past); // exception Date: 1/10/2025
             if (strcmp(tmp, "</s>") == 0 || strcmp(tmp, "<|im_end|>") == 0)
                 break;
             printf("%s", tmp);
@@ -194,7 +220,7 @@ static void process_prompt(struct internvl_context * ctx_internvl, struct intern
         }
     } else {
         for (int i = 0; i < max_tgt_len; i++) {
-            const char *tmp = sample(ctx_sampling, ctx_internvl->ctx_llama, &n_past);
+            const char *tmp = sample(smpl, ctx_internvl->ctx, &n_past);
             if (strcmp(tmp, "</s>") == 0 || strcmp(tmp, "<|im_end|>") == 0)
                 break;
             printf("%s", tmp);
@@ -202,7 +228,8 @@ static void process_prompt(struct internvl_context * ctx_internvl, struct intern
         }
     }
 
-    llama_sampling_free(ctx_sampling);
+    // llama_sampler_free(smpl);
+    gpt_sampler_free(smpl);
     printf("\n");
     }
 
@@ -225,14 +252,14 @@ static struct llama_context * llama_init_context(gpt_params * params, llama_mode
     llama_context_params ctx_params = llama_context_params_from_gpt_params(*params);
     ctx_params.n_ctx           = params->n_ctx < 2048 ? 2048 : params->n_ctx; // we need a longer context size to process image embeddings
 
-    llama_context * ctx_llama = llama_new_context_with_model(model, ctx_params);
+    llama_context * ctx = llama_new_context_with_model(model, ctx_params);
 
-    if (ctx_llama == NULL) {
+    if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
         return NULL;
     }
 
-    return ctx_llama;
+    return ctx;
 }
 
 static struct internvl_context * internvl_init_context(gpt_params * params, llama_model * model) {
@@ -248,7 +275,7 @@ static struct internvl_context * internvl_init_context(gpt_params * params, llam
 
     auto ctx_internvl = (struct internvl_context *)malloc(sizeof(internvl_context));
 
-    ctx_internvl->ctx_llama = NULL;
+    ctx_internvl->ctx = NULL;
     ctx_internvl->ctx_clip = ctx_clip;
     ctx_internvl->model = model;
     return ctx_internvl;
@@ -260,7 +287,7 @@ static void internvl_free(struct internvl_context * ctx_internvl) {
         ctx_internvl->ctx_clip = NULL;
     }
 
-    llama_free(ctx_internvl->ctx_llama);
+    llama_free(ctx_internvl->ctx);
     llama_free_model(ctx_internvl->model);
     llama_backend_free();
 }
@@ -276,8 +303,10 @@ int main(int argc, char ** argv) {
 
     gpt_params params;
 
-    if (!gpt_params_parse(argc, argv, params)) {
-        print_usage(argc, argv, params);
+    if (!gpt_params_parse(argc, argv, params, LLAMA_EXAMPLE_LLAVA, print_usage)) {
+    // if (!gpt_params_parse(argc, argv, params)) {
+        // print_usage(argc, argv, params);
+        LOG_TEE("Parameter parsing failed.\n");
         return 1;
     }
 
@@ -289,7 +318,8 @@ int main(int argc, char ** argv) {
 #endif // LOG_DISABLE_LOGS
 
     if (params.mmproj.empty() || (params.image.empty() && !prompt_contains_image(params.prompt))) {
-        print_usage(argc, argv, params);
+        print_usage(argc, argv);
+        // print_usage(argc, argv, params);
         return 1;
     }
     // printf("[debug by cxt] use prompt: %s\n", params.prompt.c_str());
@@ -316,19 +346,19 @@ int main(int argc, char ** argv) {
     //     }
     //     printf("\n");
     // }
-    // auto ctx_llama = llama_init_context(&params, model);
+    // auto ctx = llama_init_context(&params, model);
 
     auto ctx_internvl = internvl_init_context(&params, model);
-    ctx_internvl->ctx_llama = llama_init_context(&params, model);
+    ctx_internvl->ctx = llama_init_context(&params, model);
     for (auto & image : params.image) {
         for (int i=0; i<15; i++) {
 
-        ctx_internvl->ctx_llama = llama_init_context(&params, model);
+        ctx_internvl->ctx = llama_init_context(&params, model);
         // // clear kv cache
-        // llama_kv_cache_clear(ctx_internvl->ctx_llama);
+        // llama_kv_cache_clear(ctx_internvl->ctx);
 
         const int64_t t_e2e_start_us = ggml_time_us();
-        auto image_embed = load_image(ctx_internvl, &params, image);
+        auto image_embed = load_image(ctx_internvl, &params, image); // ok to load image, then fail
         if (!image_embed) {
             std::cerr << "error: failed to load image " << image << ". Terminating\n\n";
             return 1;
@@ -341,7 +371,8 @@ int main(int argc, char ** argv) {
         float t_e2e_cost_us = (t_e2e_end_us - t_e2e_start_us) / 1000.0;
         LOG_TEE("\n%s: %d e2e in %8.2f ms\n", __func__, i, t_e2e_cost_us);
 
-        llama_print_timings(ctx_internvl->ctx_llama);
+        // llama_print_timings(ctx_internvl->ctx);
+        // useless for now
 
         // internvl_adaptor_embed_free(prompt_embed);
 
